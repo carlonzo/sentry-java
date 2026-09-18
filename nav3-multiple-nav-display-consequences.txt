@@ -1,0 +1,118 @@
+Navigation 3: multiple NavDisplays and consequences for SentryNavEffect
+
+Summary
+
+Multiple back stacks are common in Navigation 3, especially for bottom navigation where each top-level destination retains its own history. Multiple simultaneously composed NavDisplay instances are possible, but they are not the normal or recommended way to implement those cases.
+
+The official Navigation 3 recipes generally combine or decorate multiple back stacks and pass one resulting entry list to one NavDisplay. Adaptive layouts that show multiple destinations at once also normally use one NavDisplay with a SceneStrategy. Dialogs, bottom sheets, overlays, and list-detail layouts can likewise be represented through scenes rather than additional NavDisplays.
+
+Multiple NavDisplays are most plausible in specialized architectures:
+
+- a root display for authentication, onboarding, and main-app flows with a nested display inside the main-app destination;
+- independent navigation regions that are visible at the same time;
+- separate activities or windows; or
+- applications carrying forward a nested-NavHost design from Navigation 2.
+
+There is no published usage telemetry that supports a precise estimate. Based on the official documentation, recipes, and community discussions, the practical classification is:
+
+- multiple back stacks: common;
+- one NavDisplay dynamically displaying different or combined back stacks: common;
+- one NavDisplay showing multiple destinations through Scenes: common and recommended for adaptive layouts;
+- multiple NavDisplays in mutually exclusive branches or separate activities: plausible;
+- multiple simultaneously composed, independently navigating NavDisplays: niche but real;
+- dynamically reassigning back stacks among several displays: very niche.
+
+How SentryNavEffect works
+
+SentryNavEffect is not connected to NavDisplay itself. It observes only the List passed as its backStack argument. It assumes that the top entry represents the current screen and uses changes to that entry to produce:
+
+- navigation breadcrumbs;
+- navigation transactions;
+- the current screen name; and
+- the navigation back stack stored in Sentry context.
+
+Each SentryNavEffect creates its own BackStackObserver. The observer privately retains its previous top entry and any navigation transaction that it started. However, all observers obtained through the public API write into the same current Sentry scope. That scope has only one current screen, one "navigation" context, and one active transaction.
+
+Scenario 1: stable one-to-one associations
+
+Suppose an application has two stable triples:
+
+- back stack A, NavDisplay A, and SentryNavEffect A; and
+- back stack B, NavDisplay B, and SentryNavEffect B.
+
+Each observer correctly tracks changes within its own stack, but the data produced by the two observers competes in the shared Sentry scope.
+
+Breadcrumbs
+
+Both effects add breadcrumbs to the same breadcrumb stream. Each individual from-to pair is correct for its own stack because each observer retains its own previous top. The combined history has no display or stack identifier, however, so it may appear to alternate between unrelated flows. For example:
+
+- to=/HomeA
+- to=/HomeB
+- from=/HomeA, to=/DetailA
+- from=/HomeB, to=/SettingsB
+
+The breadcrumbs are chronologically accurate records of two local navigation histories, but they do not form one coherent global navigation path.
+
+Screen name
+
+The Sentry scope contains one screen name. The effect that most recently processed a top-entry change overwrites it. An error can therefore be labeled with a secondary or background display's screen rather than the application's primary or focused screen.
+
+Back stack context
+
+The Sentry scope contains one navigation back stack context. Each observer replaces that context with its own stack whenever it processes a stack change, including changes below the top. Events receive whichever stack was written most recently. The stacks are not merged and the context does not identify its source display.
+
+Navigation transactions
+
+The scope allows only one active transaction. When the first effect starts a navigation transaction, another effect that processes a destination change sees the active transaction and skips creating its own transaction. It logs that the transaction was not created because another transaction is active.
+
+The observer that currently owns the active transaction can continue to stop and replace its own transaction as its stack changes. Other observers may be unable to create navigation transactions until the active transaction finishes. Once it has finished, whichever observer next processes a top change may take ownership. Transaction coverage is therefore incomplete and order-dependent.
+
+Child spans can also be associated with the wrong display. Work launched by a destination in display B may see and attach to display A's active navigation transaction.
+
+A navigation transaction that successfully starts receives its own copy of the originating observer's screen and back stack context. Its payload is internally coherent. The larger problem is that other navigation changes may not create transactions and ambient work may use the wrong active transaction.
+
+Cleanup and empty stacks
+
+When an observer leaves composition, it stops any transaction that it owns and unconditionally clears the shared navigation context when back stack capture is enabled. This can erase context written by another observer that remains active. Screen cleanup is guarded by comparing the current screen name with the observer's last screen name, but matching route names across displays can still make ownership ambiguous.
+
+An observer receiving an empty stack has similar effects: it stops its own transaction and clears shared navigation and screen state.
+
+Scenario 2: unstable associations
+
+SentryNavEffect remembers its BackStackObserver using the Sentry scopes and SentryNavOptions as keys. The back stack itself is not a remember key. Consequently, when the same Compose effect instance starts receiving another back stack, its observer retains the previous stack's top entry.
+
+If an effect switches from stack A to stack B, it treats B's top as the navigation destination following A's previous top. This can produce:
+
+- a cross-stack breadcrumb such as from=/DetailA, to=/HomeB;
+- completion of A's transaction and an attempt to start B's transaction;
+- replacement of the shared screen and navigation context with B's data; and
+- another cross-stack transition if the effect later switches back to A.
+
+For one NavDisplay that switches between tab stacks, a cross-stack breadcrumb may reasonably describe the visible user transition. In that design, one active effect follows the navigation surface currently presented to the user. It becomes misleading when several display slots are active and stacks move among those slots.
+
+If two unkeyed effect calls swap stacks while retaining their Compose identities, both observers retain their former state. They can emit mirrored transitions such as:
+
+- observer 1: A/top to B/top; and
+- observer 2: B/top to A/top.
+
+They also continue to compete for shared screen, context, and transaction state.
+
+If an effect is destroyed and recreated instead of being retained, cleanup first clears shared state and may finish its transaction. The new observer has no previous top, so its first breadcrumb contains only a destination and it may start a fresh transaction even if no real navigation occurred. Repeated reassociation can therefore look like repeated new navigation sessions.
+
+If only the relationship between a back stack and NavDisplay changes while SentryNavEffect continues observing the same list, Sentry sees no special change. SentryNavEffect has no knowledge of display identity, visibility, focus, scenes, or panes.
+
+Recommended support boundary
+
+The current implementation should be considered designed for one active SentryNavEffect per Sentry scope. Multiple simultaneously active effects are unlikely to crash the application, but their telemetry is last-writer-wins, interleaved, incomplete, and potentially misparented.
+
+Multiple back stacks do not necessarily require multiple effects. When one NavDisplay renders a selected, flattened, or combined representation of several stacks, one SentryNavEffect should observe the back stack that represents what the display is presenting.
+
+Supporting multiple independent active displays as a first-class feature would require an explicit product policy and coordination mechanism. Possible models include:
+
+- selecting one primary or focused navigation display;
+- adding stable display identifiers to breadcrumbs and captured stack data;
+- capturing several named back stacks instead of one global stack;
+- coordinating transaction ownership across observers; or
+- aggregating all displays through one navigation manager and one SentryNavEffect.
+
+Until such a model exists, documentation should state that only one SentryNavEffect should be active per Sentry scope and explain that multiple effects share and overwrite Sentry navigation state.
